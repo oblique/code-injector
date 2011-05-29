@@ -11,9 +11,9 @@ payloads.h: thread_creator_32.bin thread_creator_64.bin
 	@echo '#define PAYLOADS_H' >> payloads.h
 	@echo >> payloads.h
 	xxd -i thread_creator_32.bin >> payloads.h
-	@echo -e '\n#ifdef __x86_64__' >> payloads.h
+	@echo '#ifdef __x86_64__' >> payloads.h
 	xxd -i thread_creator_64.bin >> payloads.h
-	@echo -e '#endif\n' >> payloads.h
+	@echo '#endif' >> payloads.h
 	@echo '#endif' >> payloads.h
 
 thread_creator_32.bin: thread_creator_32.o
